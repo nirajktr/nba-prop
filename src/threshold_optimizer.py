@@ -1,7 +1,11 @@
-"""NBA prop betting backtest using logistic regression with walk-forward validation."""
+'''
+Testing different edge thresholds 
+From 1 --> 10% to find optimal threshold for each market.
+'''
+
+
 from __future__ import annotations
 
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
 
@@ -11,19 +15,16 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import accuracy_score, log_loss, roc_auc_score
 from sklearn.pipeline import Pipeline
 
-# Configuration
 DATA_PATH = Path(__file__).resolve().parent.parent / "data" / "all_odds.csv"
-SEASON_START_MIN = 2021  # Training starts from 2021 season
-SEASON_START_MAX = 2024  # Test data through 2024 season
-EDGE_THRESHOLD = 0.05  # Minimum probability edge to place a bet (model_prob - implied_prob)
+SEASON_START_MIN = 2021
+SEASON_START_MAX = 2024
 
 
-@dataclass
 class MarketSpec:
-    """Specification for a betting market."""
-    name: str  # Human-readable market name (e.g., 'total_over')
-    target_col: str  # Column containing outcome (0=loss, 1=win)
-    decimal_odds_col: str  # Column with decimal odds for implied probability
+    def __init__(self, name: str, target_col: str, decimal_odds_col: str):
+        self.name = name
+        self.target_col = target_col
+        self.decimal_odds_col = decimal_odds_col
 
 
 MARKETS: tuple[MarketSpec, ...] = (
@@ -66,16 +67,13 @@ FEATURE_COLS = [
 
 
 def compute_season_start(date_series: pd.Series) -> pd.Series:
-    """Convert dates to NBA season year (July-June calendar)."""
     dt = pd.to_datetime(date_series, format="%Y-%m-%d-%H:%M", errors="coerce")
-    # NBA season starts in July, so Jun 2021 = 2020-21 season, Jul 2021 = 2021-22 season
     return dt.dt.year.where(dt.dt.month >= 7, dt.dt.year - 1)
 
 
 def load_data(path: Path) -> pd.DataFrame:
     df = pd.read_csv(path)
 
-    # Remove the CSV index column that is persisted in the file.
     if "Unnamed: 0" in df.columns:
         df = df.drop(columns=["Unnamed: 0"])
 
@@ -114,25 +112,21 @@ def safe_log_loss(y_true: pd.Series, y_prob: pd.Series) -> float | None:
 
 
 def implied_probability(decimal_odds: pd.Series) -> pd.Series:
-    """Convert decimal odds to implied win probability (market consensus)."""
     return 1.0 / decimal_odds
 
 
 def calculate_units(y_true: pd.Series, decimal_odds: pd.Series) -> pd.Series:
-    """Calculate profit/loss in units: +profit if win, -1 if loss (unit stake)."""
-    win_units = decimal_odds - 1.0  # Profit from winning 1-unit bet
-    lose_units = -1.0  # Loss from losing 1-unit bet
+    win_units = decimal_odds - 1.0
+    lose_units = -1.0
     return y_true.astype(float) * win_units + (1.0 - y_true.astype(float)) * lose_units
 
 
-def evaluate_market(df: pd.DataFrame, market: MarketSpec) -> pd.DataFrame:
-    """Walk-forward backtest: train on past seasons, test on each future season."""
+def evaluate_market(df: pd.DataFrame, market: MarketSpec, edge_threshold: float) -> pd.DataFrame:
     rows: list[dict] = []
 
-    # Test each season with training data from all prior seasons
     for test_season in range(SEASON_START_MIN + 1, SEASON_START_MAX + 1):
-        train_df = df[df["season_start_year"] < test_season].copy()  # All prior seasons
-        test_df = df[df["season_start_year"] == test_season].copy()  # Current season only
+        train_df = df[df["season_start_year"] < test_season].copy()
+        test_df = df[df["season_start_year"] == test_season].copy()
 
         if train_df.empty or test_df.empty:
             continue
@@ -148,21 +142,17 @@ def evaluate_market(df: pd.DataFrame, market: MarketSpec) -> pd.DataFrame:
         x_test = test_df[FEATURE_COLS]
         y_test = test_df[market.target_col].astype(int)
 
-        # Train model and generate predictions
         model = build_model()
         model.fit(x_train, y_train)
 
-        # Get predicted probabilities from logistic regression
         y_prob = pd.Series(model.predict_proba(x_test)[:, 1], index=test_df.index)
-        y_pred = (y_prob >= 0.5).astype(int)  # Classification at 0.5 threshold
+        y_pred = (y_prob >= 0.5).astype(int)
 
-        # Identify profitable betting opportunities (model edge > threshold)
         implied = implied_probability(test_df[market.decimal_odds_col])
-        bet_mask = (y_prob - implied) >= EDGE_THRESHOLD  # Only bet with sufficient edge
+        bet_mask = (y_prob - implied) >= edge_threshold
 
-        # Calculate P&L for all outcomes and filter to bets only
         units = calculate_units(y_test, test_df[market.decimal_odds_col])
-        units_bet = units[bet_mask]  # P&L only for placed bets
+        units_bet = units[bet_mask]
 
         rows.append(
             {
@@ -175,7 +165,7 @@ def evaluate_market(df: pd.DataFrame, market: MarketSpec) -> pd.DataFrame:
                 "n_bets": int(bet_mask.sum()),
                 "total_units": float(units_bet.sum()) if len(units_bet) else 0.0,
                 "roi_per_bet": float(units_bet.mean()) if len(units_bet) else 0.0,
-                "edge_threshold": EDGE_THRESHOLD,
+                "edge_threshold": edge_threshold,
             }
         )
 
@@ -193,27 +183,56 @@ def main() -> None:
     if df.empty:
         raise SystemExit("No rows found after season filtering. Check game_date formatting.")
 
-    results = [evaluate_market(df, market) for market in MARKETS]
-    summary_df = summarize(results)
+    # Grid search on edge thresholds from 1% to 10%
+    thresholds = [i / 100.0 for i in range(1, 11)]
+    
+    all_agg_results = []
+    
+    for threshold in thresholds:
+        print(f"\n{'='*60}")
+        print(f"Testing edge_threshold = {threshold:.2%}")
+        print(f"{'='*60}")
+        
+        results = [evaluate_market(df, market, threshold) for market in MARKETS]
+        summary_df = summarize(results)
 
-    print("=== Backtest Results (Logistic Regression Baseline) ===")
-    print(summary_df.to_string(index=False))
-
-    agg = (
-        summary_df.groupby("market", as_index=False)
-        .agg(
-            n_games=("n_games", "sum"),
-            n_bets=("n_bets", "sum"),
-            total_units=("total_units", "sum"),
-            avg_accuracy=("accuracy", "mean"),
-            avg_roc_auc=("roc_auc", "mean"),
-            avg_roi_per_bet=("roi_per_bet", "mean"),
+        agg = (
+            summary_df.groupby("market", as_index=False)
+            .agg(
+                n_games=("n_games", "sum"),
+                n_bets=("n_bets", "sum"),
+                total_units=("total_units", "sum"),
+                avg_accuracy=("accuracy", "mean"),
+                avg_roc_auc=("roc_auc", "mean"),
+                avg_roi_per_bet=("roi_per_bet", "mean"),
+            )
+            .sort_values("market")
         )
-        .sort_values("market")
-    )
+        
+        agg["edge_threshold"] = threshold
+        all_agg_results.append(agg)
 
-    print("\n=== Aggregate by Market ===")
-    print(agg.to_string(index=False))
+        print("\n=== Aggregate by Market ===")
+        print(agg.to_string(index=False))
+
+    # Summary of best thresholds
+    print(f"\n{'='*60}")
+    print("OPTIMAL THRESHOLDS BY MARKET")
+    print(f"{'='*60}")
+    
+    full_results = pd.concat(all_agg_results, ignore_index=True)
+    
+    for market in ["total_over", "money_home", "spread_home"]:
+        market_data = full_results[full_results["market"] == market]
+        best_idx = market_data["total_units"].idxmax()
+        best_row = market_data.loc[best_idx]
+        
+        print(f"\n{market.upper()}")
+        print(f"  Best threshold: {best_row['edge_threshold']:.2%}")
+        print(f"  Total units: {best_row['total_units']:.2f}")
+        print(f"  Number of bets: {int(best_row['n_bets'])}")
+        print(f"  ROI per bet: {best_row['avg_roi_per_bet']:.4f}")
+        print(f"  Accuracy: {best_row['avg_accuracy']:.4f}")
 
 
 if __name__ == "__main__":

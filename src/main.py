@@ -1,3 +1,8 @@
+'''
+OMIT FOR NOW
+'''
+
+
 from nba_api.stats.static import teams
 
 def main():
